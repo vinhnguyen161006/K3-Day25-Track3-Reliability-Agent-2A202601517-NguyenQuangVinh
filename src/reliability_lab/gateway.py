@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
 from reliability_lab.circuit_breaker import CircuitBreaker, CircuitOpenError
-from reliability_lab.providers import FakeLLMProvider, ProviderError, ProviderResponse
+from reliability_lab.providers import FakeLLMProvider, ProviderError
 
 
 @dataclass(slots=True)
@@ -32,30 +32,53 @@ class ReliabilityGateway:
         self.cache = cache
 
     def complete(self, prompt: str) -> GatewayResponse:
-        """Return a reliable response or a static fallback.
+        """Route a prompt through cache -> provider chain -> static fallback.
 
-        TODO(student): Implement the full request routing pipeline:
-
-        1. CACHE CHECK — if self.cache is not None:
-           - Call self.cache.get(prompt) → (cached_text, score)
-           - If cached_text is not None, return GatewayResponse with:
-             route=f"cache_hit:{score:.2f}", cache_hit=True, latency=0, cost=0
-
-        2. PROVIDER FALLBACK CHAIN — iterate self.providers in order:
-           - Get the circuit breaker: self.breakers[provider.name]
-           - Try breaker.call(provider.complete, prompt)
-           - On success:
-             a. Store in cache: self.cache.set(prompt, response.text, {"provider": provider.name})
-             b. Determine route: "primary" if first provider, else "fallback"
-             c. Return GatewayResponse with provider info, latency, cost
-           - On ProviderError or CircuitOpenError: save error, continue to next provider
-
-        3. STATIC FALLBACK — if all providers fail:
-           - Return GatewayResponse with:
-             text="The service is temporarily degraded. Please try again soon."
-             route="static_fallback", error=last_error
-
-        BONUS TODO: Add cost budget tracking — if cumulative cost exceeds a threshold,
-        skip expensive providers and route to cache or cheaper fallback.
+        Cache is checked first; a hit above the similarity threshold short
+        circuits the whole pipeline. Otherwise providers are tried in the
+        configured order, each guarded by its own circuit breaker, so a
+        provider that is open or erroring is skipped rather than retried.
+        If every provider fails, a degraded static response is returned
+        instead of propagating the error to the caller.
         """
-        raise NotImplementedError("TODO: implement complete()")
+        if self.cache is not None:
+            cached, score = self.cache.get(prompt)
+            if cached is not None:
+                return GatewayResponse(
+                    text=cached,
+                    route=f"cache_hit:{score:.2f}",
+                    provider=None,
+                    cache_hit=True,
+                    latency_ms=0.0,
+                    estimated_cost=0.0,
+                )
+
+        last_error: str | None = None
+        for index, provider in enumerate(self.providers):
+            breaker = self.breakers[provider.name]
+            try:
+                result = breaker.call(provider.complete, prompt)
+            except (ProviderError, CircuitOpenError) as exc:
+                last_error = str(exc)
+                continue
+
+            if self.cache is not None:
+                self.cache.set(prompt, result.text, {"provider": provider.name})
+            return GatewayResponse(
+                text=result.text,
+                route="primary" if index == 0 else "fallback",
+                provider=provider.name,
+                cache_hit=False,
+                latency_ms=result.latency_ms,
+                estimated_cost=result.estimated_cost,
+            )
+
+        return GatewayResponse(
+            text="The service is temporarily degraded. Please try again soon.",
+            route="static_fallback",
+            provider=None,
+            cache_hit=False,
+            latency_ms=0.0,
+            estimated_cost=0.0,
+            error=last_error,
+        )

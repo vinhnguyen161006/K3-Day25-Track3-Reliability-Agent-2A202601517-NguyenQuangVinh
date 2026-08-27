@@ -7,19 +7,18 @@ from __future__ import annotations
 import time
 
 import pytest
+import redis as redis_lib
 
 from reliability_lab.cache import SharedRedisCache
 
 
 def _redis_available() -> bool:
     try:
-        import redis as redis_lib
-
         r = redis_lib.Redis.from_url("redis://localhost:6379/0")
         r.ping()
         r.close()
         return True
-    except Exception:
+    except redis_lib.exceptions.RedisError:
         return False
 
 
